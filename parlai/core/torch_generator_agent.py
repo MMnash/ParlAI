@@ -567,11 +567,13 @@ class TorchGeneratorAgent(TorchAgent, ABC):
         new_vec = []
         if hasattr(vec, 'cpu'):
             vec = vec.cpu()
+        start = True
         for i in vec:
-            if i == self.END_IDX:
+            if not start and i == self.END_IDX:
                 break
             elif i != self.START_IDX:
                 new_vec.append(i)
+            start = False
         return self.dict.vec2txt(new_vec)
 
     def set_interactive_mode(self, mode, shared=False):
@@ -877,7 +879,6 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             )
             preds, scores = zip(*beam_preds_scores)
             self._add_generation_metrics(batch, preds)
-
             # bsz x beamsize
             beam_texts: List[List[Tuple[str, float]]] = []
             for beam in beams:

@@ -12,16 +12,27 @@ The T5 agent can be instantiated as simply `-m t5`
 """
 import torch
 from typing import Optional, Dict, Any, Tuple
-from transformers import T5ForConditionalGeneration
 
-try:
-    from transformers.models.t5.modeling_t5 import T5Stack
-except ModuleNotFoundError:
-    # Prior versions of transformers package do not have T5Stack
-    T5Stack = object
+# from transformers import T5ForConditionalGeneration
+
+
+from transformers import (
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+)
+
+from transformers import LEDTokenizer, TFLEDForConditionalGeneration
+
+# try:
+#     from transformers.models.t5.modeling_t5 import T5Stack
+# except ModuleNotFoundError:
+#     # Prior versions of transformers package do not have T5Stack
+# T5Stack = object
 
 from parlai.agents.hugging_face.hugging_face import HF_VERSION
-from parlai.agents.hugging_face.dict import T5DictionaryAgent
+from parlai.agents.hugging_face.dict import LEDDictionaryAgent
 
 from parlai.core.opt import Opt
 from parlai.core.params import ParlaiParser
@@ -29,12 +40,22 @@ from parlai.core.torch_agent import Batch, TorchAgent
 from parlai.core.torch_generator_agent import TorchGeneratorAgent, TorchGeneratorModel
 
 
-def build_t5(opt: Opt) -> T5ForConditionalGeneration:
-    # if not HF_VERSION >= 4.3:
-    #     raise RuntimeError('Must use transformers package >= 4.3 to use t5')
-    return T5ForConditionalGeneration.from_pretrained(
-        opt['t5_model_arch'], dropout_rate=opt['t5_dropout']
+def build_led(opt: Opt) -> AutoModelForSeq2SeqLM:
+    mname = 'allenai/led-base-16384'
+    # model = TFLEDForConditionalGeneration.from_pretrained(opt["led_model_arch"], dropout=opt["led_dropout"])
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        opt["led_model_arch"], gradient_checkpointing=True, use_cache=False
     )
+    model.config.num_beams = 4
+    model.config.max_length = 512
+    model.config.min_length = 100
+    model.config.length_penalty = 2.0
+    model.config.early_stopping = True
+    model.config.no_repeat_ngram_size = 3
+    return model
+    # return T5ForConditionalGeneration.from_pretrained(
+    #     opt['t5_model_arch'], dropout_rate=opt['t5_dropout']
+    # )
 
 
 def set_device(func):
@@ -56,11 +77,11 @@ def set_device(func):
     return wrap
 
 
-class T5Agent(TorchGeneratorAgent):
+class LedAgent(TorchGeneratorAgent):
     """
-    T5 Agent.
+    LED (Longformer-Encoder-Decoder) Agent.
 
-    Relies on the T5 model implemented in huggingface
+    Relies on the LED model implemented in huggingface
     """
 
     @classmethod
@@ -68,127 +89,113 @@ class T5Agent(TorchGeneratorAgent):
         cls, parser: ParlaiParser, partial_opt: Optional[Opt] = None
     ) -> ParlaiParser:
         super().add_cmdline_args(parser, partial_opt=partial_opt)
-        group = parser.add_argument_group('T5 Args')
+        group = parser.add_argument_group('LED Args')
         group.add_argument(
-            '--t5-model-arch',
+            '--led-model-arch',
             type=str,
-            default='t5-base',
-            choices=["t5-small", "t5-base", "t5-large", "t5-3b", "t5-11b"],
+            default='allenai/led-large-16384',
+            choices=["allenai/led-base-16384", "allenai/led-large-16384"],
         )
+
         group.add_argument(
-            '--t5-model-parallel',
-            type='bool',
-            default=False,
-            help='use HF model parallel',
+            '--led-dropout', type=float, default=0.1, help='Dropout for LED'
         )
-        group.add_argument(
-            '--t5-dropout', type=float, default=0.0, help='Dropout for T5'
-        )
-        group.add_argument(
-            '--t5-generation-config',
-            type=str,
-            default=None,
-            choices=[
-                'summarization',
-                'translation_en_to_de',
-                'translation_en_to_fr',
-                'translation_en_to_ro',
-            ],
-            help='Task specific generation config for T5',
-        )
+
         return parser
 
-    def build_model(self) -> 'ParlaiT5Model':
+    def build_model(self) -> 'ParlaiLEDModel':
         """
         Build and return model.
         """
-        model = ParlaiT5Model(self.opt, self.dict)
-        if self.opt['t5_model_parallel']:
-            model.t5.parallelize()
+        model = ParlaiLEDModel(self.opt, self.dict)
+
         return model
 
     def build_dictionary(self):
         """
         Overrides TorchAgent.build_dictionary to use t5 dict.
         """
-        return T5DictionaryAgent(self.opt)
+        return LEDDictionaryAgent(self.opt)
 
     def vectorize(self, *args, **kwargs):
         """
-        Override vectorize for T5.
+        Override vectorize for LED.
 
-        T5 dict already adds the end token.
+        LED dict already adds the end token.
         """
         kwargs['add_start'] = False  # model does this in module code
         kwargs['add_end'] = False  # T5 tokenizer takes care of this
         return TorchAgent.vectorize(self, *args, **kwargs)
 
-    def observe(self, observation):
-        """
-        Override to include prefix, if necessary.
-        """
-        if self.opt['t5_generation_config'] is not None and 'text' in observation:
-            config = TASK_CONFIGS[self.opt['t5_generation_config']]
-            try:
-                observation.force_set('text', config['prefix'] + observation['text'])
-            except AttributeError:
-                observation['text'] = config['prefix'] + observation['text']
+    # def observe(self, observation):
+    #     """
+    #     Override to include prefix, if necessary.
+    #     """
+    #     if self.opt['t5_generation_config'] is not None and 'text' in observation:
+    #         config = TASK_CONFIGS[self.opt['t5_generation_config']]
+    #         try:
+    #             observation.force_set('text', config['prefix'] + observation['text'])
+    #         except AttributeError:
+    #             observation['text'] = config['prefix'] + observation['text']
 
-        return super().observe(observation)
+    #     return super().observe(observation)
 
-    def _generate(
-        self,
-        batch: Batch,
-        beam_size: int,
-        max_ts: int,
-        prefix_tokens: Optional[torch.LongTensor] = None,
-        overrides: Optional[Dict[str, Any]] = None,
-    ):
-        """
-        Generate an output with beam search.
+    # def _generate(
+    #     self,
+    #     batch: Batch,
+    #     beam_size: int,
+    #     max_ts: int,
+    #     prefix_tokens: Optional[torch.LongTensor] = None,
+    #     overrides: Optional[Dict[str, Any]] = None,
+    # ):
+    #     """
+    #     Generate an output with beam search.
 
-        Use HF's built-in generation to perform beam search.
-        """
-        bad_words_ids = None
-        if self.beam_block_list is not None:
-            bad_words_ids = [
-                gram for _, ngram in self.beam_block_list.items() for gram in ngram
-            ]
+    #     Use HF's built-in generation to perform beam search.
+    #     """
+    #     bad_words_ids = None
+    #     if self.beam_block_list is not None:
+    #         bad_words_ids = [
+    #             gram for _, ngram in self.beam_block_list.items() for gram in ngram
+    #         ]
 
-        method = self.opt.get('inference', 'greedy')
+    #     method = self.opt.get('inference', 'greedy')
 
-        generation_params = {
-            'input_ids': batch.text_vec,
-            'max_length': max_ts,
-            'min_length': self.beam_min_length,
-            'do_sample': self.opt['inference'] in ['topk', 'topp'],
-            'early_stopping': None,
-            'num_beams': beam_size,
-            'temperature': self.temperature,
-            'top_k': self.opt['topk'] if method in ['topk', 'delayedbeam'] else None,
-            'top_p': self.opt['topp'] if method == 'nucleus' else None,
-            'repetition_penalty': None,
-            'bad_words_ids': bad_words_ids if bad_words_ids else None,
-            'bos_token_id': self.START_IDX,
-            'pad_token_id': self.NULL_IDX,
-            'eos_token_id': self.END_IDX,
-            'length_penalty': self.opt['beam_length_penalty'],
-            'no_repeat_ngram_size': self.beam_block_ngram,
-            'num_return_sequences': None,
-            'attention_mask': batch.text_vec != self.NULL_IDX,
-            'decoder_start_token_id': self.NULL_IDX,
-        }
+    #     generation_params = {
+    #         'input_ids': batch.text_vec,
+    #         'max_length': max_ts,
+    #         'min_length': self.beam_min_length,
+    #         'do_sample': self.opt['inference'] in ['topk', 'topp'],
+    #         'early_stopping': None,
+    #         'num_beams': beam_size,
+    #         'temperature': self.temperature,
+    #         'top_k': self.opt['topk'] if method in ['topk', 'delayedbeam'] else None,
+    #         'top_p': self.opt['topp'] if method == 'nucleus' else None,
+    #         'repetition_penalty': None,
+    #         'bad_words_ids': bad_words_ids if bad_words_ids else None,
+    #         'bos_token_id': self.START_IDX,
+    #         'pad_token_id': self.NULL_IDX,
+    #         'eos_token_id': self.END_IDX,
+    #         'length_penalty': self.opt['beam_length_penalty'],
+    #         'no_repeat_ngram_size': self.beam_block_ngram,
+    #         'num_return_sequences': None,
+    #         'attention_mask': batch.text_vec != self.NULL_IDX,
+    #         'decoder_start_token_id': self.NULL_IDX,
+    #     }
+    #     # input_ids=input_ids, attention_mask=attention_mask,
+    #     #                                     use_cache=True, max_length=self.args.max_output_len,
+    #     #                                     num_beams=1
 
-        if self.opt['t5_generation_config']:
-            config = TASK_CONFIGS[self.opt['t5_generation_config']]
-            config.pop('prefix', None)
-            generation_params.update(config)
-        if overrides:
-            generation_params.update(overrides)
+    #     # if self.opt['t5_generation_config']:
+    #     #     config = TASK_CONFIGS[self.opt['t5_generation_config']]
+    #     #     config.pop('prefix', None)
+    #     #     generation_params.update(config)
+    #     if overrides:
+    #         generation_params.update(overrides)
 
-        outputs = self.model.t5.generate(**generation_params)
-        outputs = [(outputs[i], 0) for i in range(outputs.size(0))]
-        return outputs, []
+    #     outputs = self.model.generate(**generation_params)
+    #     outputs = [(outputs[i], 0) for i in range(outputs.size(0))]
+    #     return outputs, []
 
 
 ##############
@@ -196,14 +203,11 @@ class T5Agent(TorchGeneratorAgent):
 ##############
 
 
-class ParlaiT5Encoder(torch.nn.Module):
-    def __init__(self, opt: Opt, encoder: T5Stack, padding_idx: Optional[int] = None):
+class ParlaiLEDEncoder(torch.nn.Module):
+    def __init__(self, opt: Opt, encoder: object, padding_idx: Optional[int] = None):
         super().__init__()
         self.stack = encoder
         self.padding_idx = padding_idx
-        self.paralleled = not opt[
-            't5_model_parallel'
-        ]  # need to parallel in forward; bug in HF
 
     @set_device
     def forward(
@@ -222,8 +226,7 @@ class ParlaiT5Encoder(torch.nn.Module):
         :param LongTensor[batch,seqlen] segments:
             If provided, additionally adds ``segments`` as extra embedding features.
         """
-        if not self.paralleled:
-            self.stack.parallelize()
+
         mask = input != self.padding_idx
         outputs = self.stack(input, attention_mask=mask, output_hidden_states=False)
         for k in outputs:
@@ -232,14 +235,11 @@ class ParlaiT5Encoder(torch.nn.Module):
         return outputs[0], mask
 
 
-class ParlaiT5Decoder(torch.nn.Module):
-    def __init__(self, opt: Opt, decoder: T5Stack, padding_idx: Optional[int] = None):
+class ParlaiLEDDecoder(torch.nn.Module):
+    def __init__(self, opt: Opt, decoder: object, padding_idx: Optional[int] = None):
         super().__init__()
         self.stack = decoder
         self.padding_idx = padding_idx
-        self.paralleled = not opt[
-            't5_model_parallel'
-        ]  # need to parallel in forward; bug in HF
 
     @set_device
     def forward(
@@ -256,8 +256,7 @@ class ParlaiT5Decoder(torch.nn.Module):
             The incremental state: a dictionary whose keys index the layers and whose
             values contain the incremental state for each layer.
         """
-        if not self.paralleled:
-            self.stack.parallelize()
+
         encoder_output, encoder_mask = encoder_state
 
         mask = input != self.padding_idx
@@ -272,7 +271,7 @@ class ParlaiT5Decoder(torch.nn.Module):
         return outputs[0].to(input.device), incr_state
 
 
-class ParlaiT5Model(TorchGeneratorModel):
+class ParlaiLEDModel(TorchGeneratorModel):
     """
     Wrap T5 in ParlAI.
     """
@@ -282,9 +281,9 @@ class ParlaiT5Model(TorchGeneratorModel):
         self.start_idx = self.pad_idx
         self.end_idx = dictionary[dictionary.end_token]
         super().__init__(self.pad_idx, self.start_idx, self.end_idx)
-        self.t5 = build_t5(opt)
-        self.encoder = ParlaiT5Encoder(opt, self.t5.get_encoder(), self.pad_idx)
-        self.decoder = ParlaiT5Decoder(opt, self.t5.get_decoder(), self.pad_idx)
+        self.model = build_led(opt)
+        self.encoder = ParlaiLEDEncoder(opt, self.model.get_encoder(), self.pad_idx)
+        self.decoder = ParlaiLEDDecoder(opt, self.model.get_decoder(), self.pad_idx)
 
     @set_device
     def _get_initial_forced_decoder_input(self, bsz: int, inputs: torch.LongTensor):
@@ -332,8 +331,8 @@ class ParlaiT5Model(TorchGeneratorModel):
         # Taken directly from HuggingFace
         # Rescale output before projecting on vocab
         # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/transformer.py#L586
-        tensor = tensor * (self.t5.model_dim ** -0.5)
-        lm_logits = self.t5.lm_head(tensor)
+        # tensor = tensor * (self.model.model_dim ** -0.5)
+        lm_logits = self.model.lm_head(tensor)
         return lm_logits
 
 
